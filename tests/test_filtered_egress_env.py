@@ -1,10 +1,12 @@
 import asyncio
 import json
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from pier.environments.agent_setup import (
     EGRESS_PROXY_PORT,
     EGRESS_PROXY_SERVICE,
     docker_run_command,
+    egress_proxy_image_name,
     proxy_environment,
     write_docker_proxy_compose,
 )
@@ -28,6 +30,18 @@ def test_docker_proxy_compose_does_not_inject_proxy_env_into_main(tmp_path):
     assert main["networks"] == ["pier-egress-internal"]
     assert EGRESS_PROXY_SERVICE in main["depends_on"]
 
+    proxy = compose["services"][EGRESS_PROXY_SERVICE]
+    assert proxy["image"] == egress_proxy_image_name()
+    assert proxy["pull_policy"] == "never"
+    assert "build" not in proxy
+
+
+def test_egress_proxy_image_name_is_content_addressed():
+    image_name = egress_proxy_image_name()
+
+    assert image_name.startswith("pier-egress-proxy:")
+    assert len(image_name.rsplit(":", 1)[1]) == 16
+
 
 def test_docker_agent_process_env_adds_proxy_only_for_agent_commands():
     env = DockerEnvironment.__new__(DockerEnvironment)
@@ -39,6 +53,38 @@ def test_docker_agent_process_env_adds_proxy_only_for_agent_commands():
 
     assert process_env["OPENAI_API_KEY"] == "test"
     assert process_env["HTTP_PROXY"].startswith("http://agent:secret@")
+
+
+def test_cached_egress_proxy_image_skips_build(tmp_path):
+    env = DockerEnvironment.__new__(DockerEnvironment)
+    env._egress_proxy_image_name = egress_proxy_image_name()
+    env._egress_proxy_build_context_dir = tmp_path
+    env._docker_image_exists = AsyncMock(return_value=True)
+
+    with patch(
+        "pier.environments.docker.docker.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as create_subprocess:
+        asyncio.run(env._ensure_egress_proxy_image())
+
+    env._docker_image_exists.assert_awaited_once_with(egress_proxy_image_name())
+    create_subprocess.assert_not_awaited()
+
+
+def test_docker_delete_removes_only_compose_local_images():
+    env = DockerEnvironment.__new__(DockerEnvironment)
+    env._keep_containers = False
+    env.logger = MagicMock()
+    env.prepare_logs_for_host = AsyncMock()
+    env._run_docker_compose_command = AsyncMock()
+    env._cleanup_resources_compose_file = MagicMock()
+
+    asyncio.run(env.stop(delete=True))
+
+    env._run_docker_compose_command.assert_awaited_once_with(
+        ["down", "--rmi", "local", "--volumes", "--remove-orphans"]
+    )
+    env._cleanup_resources_compose_file.assert_called_once_with()
 
 
 def test_modal_agent_process_env_adds_proxy_only_for_agent_commands():

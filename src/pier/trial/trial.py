@@ -188,6 +188,7 @@ class Trial:
         self._are_agent_logs_downloaded = False
         self._are_artifacts_collected = False
         self._is_agent_environment_stopped = False
+        self._agent_environment_images_kept = False
 
         self._hooks: dict[TrialEvent, list[TrialHookCallback]] = {
             event: [] for event in TrialEvent
@@ -483,24 +484,31 @@ class Trial:
         # agent image (tests/Dockerfile), so the pre-verification stop must not
         # `down --rmi` it — fatal for local-only images, a gratuitous re-pull
         # for registry-backed ones.
-        if self._is_agent_environment_stopped:
+        delete = self.config.environment.delete and not keep_images
+        finishing_deferred_image_cleanup = (
+            self._is_agent_environment_stopped
+            and self._agent_environment_images_kept
+            and delete
+        )
+        if self._is_agent_environment_stopped and not finishing_deferred_image_cleanup:
             return
 
         try:
-            await asyncio.shield(
-                self._environment.stop(
-                    delete=self.config.environment.delete and not keep_images
-                )
-            )
+            await asyncio.shield(self._environment.stop(delete=delete))
             self._is_agent_environment_stopped = True
+            self._agent_environment_images_kept = (
+                self.config.environment.delete and keep_images
+            )
         except asyncio.CancelledError:
             self._is_agent_environment_stopped = True
+            self._agent_environment_images_kept = False
             logger.warning(
                 f"Cleanup interrupted for {self.config.trial_name}, "
                 "but environment stop is shielded and will complete"
             )
         except Exception as e:
             self._is_agent_environment_stopped = True
+            self._agent_environment_images_kept = False
             logger.warning(
                 f"Warning: Environment cleanup failed for {self.config.trial_name}: {e}"
             )

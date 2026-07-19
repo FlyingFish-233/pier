@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from pier.environments.agent_setup import (
     EGRESS_PROXY_PORT,
     EGRESS_PROXY_SERVICE,
+    egress_proxy_image_name,
     new_proxy_token,
     proxy_environment,
     write_agent_dockerfile,
@@ -104,6 +105,7 @@ class DockerEnvironment(BaseEnvironment):
 
     # Class-level lock per image name to prevent parallel builds of the same image.
     _image_build_locks: dict[str, asyncio.Lock] = {}
+    _shared_image_build_locks: dict[str, asyncio.Lock] = {}
 
     @staticmethod
     def _detect_daemon_os() -> str | None:
@@ -201,6 +203,8 @@ class DockerEnvironment(BaseEnvironment):
         self._resources_compose_path: Path | None = None
         self._agent_build_context_dir: Path | None = None
         self._egress_proxy_compose_path: Path | None = None
+        self._egress_proxy_build_context_dir: Path | None = None
+        self._egress_proxy_image_name: str | None = None
         self._egress_proxy_env: dict[str, str] = {}
 
         install_fingerprint = (
@@ -400,12 +404,60 @@ class DockerEnvironment(BaseEnvironment):
         self._egress_proxy_env = proxy_environment(
             token, EGRESS_PROXY_SERVICE, EGRESS_PROXY_PORT
         )
+        self._egress_proxy_build_context_dir = (
+            self.trial_paths.trial_dir / "egress-proxy"
+        )
+        self._egress_proxy_image_name = egress_proxy_image_name()
         self._egress_proxy_compose_path = write_docker_proxy_compose(
             path=self.trial_paths.trial_dir / "docker-compose-egress-proxy.json",
-            proxy_dir=self.trial_paths.trial_dir / "egress-proxy",
+            proxy_dir=self._egress_proxy_build_context_dir,
             allowlist=allowlist,
             token=token,
         )
+
+    @staticmethod
+    async def _docker_image_exists(image_name: str) -> bool:
+        process = await asyncio.create_subprocess_exec(
+            "docker",
+            "image",
+            "inspect",
+            image_name,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await process.communicate()
+        return process.returncode == 0
+
+    async def _ensure_egress_proxy_image(self) -> None:
+        image_name = self._egress_proxy_image_name
+        build_context = self._egress_proxy_build_context_dir
+        if image_name is None or build_context is None:
+            return
+        if await self._docker_image_exists(image_name):
+            return
+
+        lock = self._shared_image_build_locks.setdefault(image_name, asyncio.Lock())
+        async with lock:
+            if await self._docker_image_exists(image_name):
+                return
+            process = await asyncio.create_subprocess_exec(
+                "docker",
+                "build",
+                "--tag",
+                image_name,
+                str(build_context.resolve().absolute()),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            stdout_bytes, _ = await process.communicate()
+            if process.returncode != 0:
+                output = stdout_bytes.decode(errors="replace") if stdout_bytes else ""
+                raise RuntimeError(
+                    f"Failed to build shared egress proxy image {image_name}. "
+                    f"Output: {output}"
+                )
 
     def agent_process_env(self, env: dict[str, str] | None) -> dict[str, str] | None:
         if not self._egress_proxy_env:
@@ -627,6 +679,8 @@ class DockerEnvironment(BaseEnvironment):
         # Fail fast if the daemon mode disagrees with the task's declared OS.
         self._validate_daemon_mode()
 
+        await self._ensure_egress_proxy_image()
+
         if not self._use_prebuilt:
             # Serialize image builds: if multiple environments with the same image name
             # start concurrently, only one builds while others wait for the cached image.
@@ -695,8 +749,10 @@ class DockerEnvironment(BaseEnvironment):
                 self.logger.warning(f"Docker compose stop failed: {e}")
         elif delete:
             try:
+                # Remove Compose-local trial images while preserving explicitly
+                # named shared images such as the egress proxy cache.
                 await self._run_docker_compose_command(
-                    ["down", "--rmi", "all", "--volumes", "--remove-orphans"]
+                    ["down", "--rmi", "local", "--volumes", "--remove-orphans"]
                 )
             except Exception as e:
                 self.logger.warning(f"Docker compose down failed: {e}")

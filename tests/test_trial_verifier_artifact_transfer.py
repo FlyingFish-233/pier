@@ -9,7 +9,7 @@ import asyncio
 import functools
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from pier.environments.base import ExecResult
 from pier.models.task.config import TaskOS
@@ -141,12 +141,12 @@ def _make_factory_recorder(
     return fake_create, calls
 
 
-async def _run_trial(task_dir, trials_dir, fake_create):
+async def _run_trial(task_dir, trials_dir, fake_create, *, delete: bool = False):
     config = TrialConfig(
         task=TrialTaskConfig(path=task_dir),
         trials_dir=trials_dir,
         agent=AgentConfig(name="oracle"),
-        environment=EnvironmentConfig(type="docker", delete=False),
+        environment=EnvironmentConfig(type="docker", delete=delete),
         verifier=VerifierConfig(),
     )
     with (
@@ -438,6 +438,30 @@ class TestSeparateVerifierAgentEnvLifecycle:
             await _run_trial(task_dir, trials_dir, fake_create)
 
             assert events.index("agent_stop") < events.index("verifier_start")
+
+    @run_async
+    async def test_agent_images_are_removed_after_separate_verifier_finishes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task_dir = _single_step_task_with_separate_verifier(Path(tmp))
+            trials_dir = Path(tmp) / "trials"
+            trials_dir.mkdir()
+
+            agent_env = _make_env(mounted=True)
+            verifier_env = _make_env(mounted=True)
+            fake_create, _calls = _make_factory_recorder(agent_env, [verifier_env])
+
+            await _run_trial(
+                task_dir,
+                trials_dir,
+                fake_create,
+                delete=True,
+            )
+
+            assert agent_env.stop.await_args_list == [
+                call(delete=False),
+                call(delete=True),
+            ]
+            verifier_env.stop.assert_awaited_once_with(delete=True)
 
     @run_async
     async def test_final_separate_step_stops_agent_env_before_verifier_starts(self):

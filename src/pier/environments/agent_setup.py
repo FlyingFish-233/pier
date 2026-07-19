@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import shlex
@@ -11,6 +12,7 @@ from pier.models.agent.network import NetworkAllowlist
 AGENT_INSTALL_DIR = ".pier-agent-install"
 EGRESS_PROXY_SERVICE = "pier-egress-proxy"
 EGRESS_PROXY_PORT = 8080
+EGRESS_PROXY_IMAGE_REPOSITORY = "pier-egress-proxy"
 
 
 def docker_run_command(script: str) -> str:
@@ -114,7 +116,7 @@ auth_param basic realm PierPolicyProxy
 acl authenticated proxy_auth REQUIRED
 
 acl SSL_ports port 443
-acl Safe_ports port 80 443
+acl Safe_ports port 80 443 30012
 acl CONNECT method CONNECT
 acl allowed_domains dstdomain "/tmp/allowed_domains.txt"
 
@@ -134,6 +136,28 @@ exec squid -N -f /tmp/squid.conf -d 1
 """
 
 
+def egress_proxy_dockerfile() -> str:
+    return "\n".join(
+        [
+            "FROM ubuntu:24.04",
+            "RUN apt-get update && "
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
+            "apache2-utils ca-certificates squid && "
+            "rm -rf /var/lib/apt/lists/*",
+            "COPY start-squid.sh /usr/local/bin/start-squid.sh",
+            "RUN chmod +x /usr/local/bin/start-squid.sh",
+            'CMD ["bash", "/usr/local/bin/start-squid.sh"]',
+            "",
+        ]
+    )
+
+
+def egress_proxy_image_name() -> str:
+    content = f"{egress_proxy_dockerfile()}\0{squid_bootstrap_command()}"
+    digest = hashlib.sha256(content.encode()).hexdigest()[:16]
+    return f"{EGRESS_PROXY_IMAGE_REPOSITORY}:{digest}"
+
+
 def proxy_policy_env(allowlist: NetworkAllowlist, token: str) -> dict[str, str]:
     return {
         "PROXY_TOKEN": token,
@@ -149,21 +173,7 @@ def write_docker_proxy_compose(
     token: str,
 ) -> Path:
     proxy_dir.mkdir(parents=True, exist_ok=True)
-    (proxy_dir / "Dockerfile").write_text(
-        "\n".join(
-            [
-                "FROM ubuntu:24.04",
-                "RUN apt-get update && "
-                "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
-                "apache2-utils ca-certificates squid && "
-                "rm -rf /var/lib/apt/lists/*",
-                "COPY start-squid.sh /usr/local/bin/start-squid.sh",
-                "RUN chmod +x /usr/local/bin/start-squid.sh",
-                'CMD ["bash", "/usr/local/bin/start-squid.sh"]',
-                "",
-            ]
-        )
-    )
+    (proxy_dir / "Dockerfile").write_text(egress_proxy_dockerfile())
     (proxy_dir / "start-squid.sh").write_text(squid_bootstrap_command())
     compose = {
         "services": {
@@ -176,7 +186,8 @@ def write_docker_proxy_compose(
                 },
             },
             EGRESS_PROXY_SERVICE: {
-                "build": {"context": str(proxy_dir.resolve().absolute())},
+                "image": egress_proxy_image_name(),
+                "pull_policy": "never",
                 "environment": proxy_policy_env(allowlist, token),
                 "healthcheck": {
                     "test": ["CMD-SHELL", "bash -lc '</dev/tcp/127.0.0.1/8080'"],
