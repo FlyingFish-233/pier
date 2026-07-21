@@ -24,6 +24,7 @@ from pier.models.trajectories import (
     Observation,
     ObservationResult,
     Step,
+    SubagentTrajectoryRef,
     ToolCall,
     Trajectory,
 )
@@ -672,19 +673,23 @@ class ClaudeCode(BaseInstalledAgent):
         flush()
         return result
 
-    def _parse_total_cost_from_stream_json(self) -> float | None:
-        """Extract authoritative `total_cost_usd` from Claude Code's stdout stream.
+    def _parse_final_result_metrics_from_stream_json(
+        self,
+    ) -> dict[str, int | float] | None:
+        """Extract aggregate metrics from the last Claude Code result event.
 
-        Claude Code's `--output-format=stream-json --print` mode emits a final
-        ``{"type":"result", ..., "total_cost_usd": <float>, ...}`` line to stdout,
-        which Pier tees to ``<logs_dir>/claude-code.txt``. Returns ``None`` if
-        the file is missing, malformed, or the result event lacks the field.
+        Background agents can cause Claude Code to emit several ``result``
+        events. The final event's ``modelUsage`` is the authoritative aggregate
+        for the whole run, including subagents, so earlier partial results must
+        not be returned.
         """
         stream_path = self.logs_dir / "claude-code.txt"
         try:
             content = stream_path.read_text(encoding="utf-8")
         except OSError:
             return None
+
+        final_result: dict[str, Any] | None = None
         for line in content.splitlines():
             line = line.strip()
             if not line or not line.startswith("{"):
@@ -694,18 +699,91 @@ class ClaudeCode(BaseInstalledAgent):
             except json.JSONDecodeError:
                 continue
             if event.get("type") == "result":
-                cost = event.get("total_cost_usd")
-                if cost is None:
-                    return None
-                try:
-                    return float(cost)
-                except (TypeError, ValueError):
-                    return None
-        return None
+                final_result = event
 
-    def _convert_events_to_trajectory(self, session_dir: Path) -> Trajectory | None:
+        if final_result is None:
+            return None
+
+        metrics: dict[str, int | float] = {}
+        model_usage = final_result.get("modelUsage")
+        if isinstance(model_usage, dict):
+            input_tokens = 0
+            cache_read_tokens = 0
+            cache_creation_tokens = 0
+            output_tokens = 0
+            usage_seen = False
+            model_cost = 0.0
+            model_cost_seen = False
+
+            for usage in model_usage.values():
+                if not isinstance(usage, dict):
+                    continue
+                for key, accumulator in (
+                    ("inputTokens", "input"),
+                    ("cacheReadInputTokens", "cache_read"),
+                    ("cacheCreationInputTokens", "cache_creation"),
+                    ("outputTokens", "output"),
+                ):
+                    value = usage.get(key)
+                    if not isinstance(value, (int, float)) or isinstance(value, bool):
+                        continue
+                    usage_seen = True
+                    if accumulator == "input":
+                        input_tokens += int(value)
+                    elif accumulator == "cache_read":
+                        cache_read_tokens += int(value)
+                    elif accumulator == "cache_creation":
+                        cache_creation_tokens += int(value)
+                    else:
+                        output_tokens += int(value)
+
+                cost = usage.get("costUSD")
+                if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+                    model_cost += float(cost)
+                    model_cost_seen = True
+
+            if usage_seen:
+                metrics.update(
+                    {
+                        "total_prompt_tokens": input_tokens
+                        + cache_read_tokens
+                        + cache_creation_tokens,
+                        "total_completion_tokens": output_tokens,
+                        "total_cached_tokens": cache_read_tokens,
+                        "total_cache_creation_input_tokens": cache_creation_tokens,
+                        "total_cache_read_input_tokens": cache_read_tokens,
+                    }
+                )
+
+            if model_cost_seen:
+                metrics["total_cost_usd"] = model_cost
+
+        cost = final_result.get("total_cost_usd")
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            metrics["total_cost_usd"] = float(cost)
+
+        return metrics or None
+
+    def _parse_total_cost_from_stream_json(self) -> float | None:
+        """Return the total cost from the final aggregate result event."""
+        metrics = self._parse_final_result_metrics_from_stream_json()
+        if metrics is None:
+            return None
+        cost = metrics.get("total_cost_usd")
+        return float(cost) if cost is not None else None
+
+    def _convert_events_to_trajectory(
+        self,
+        session_dir: Path,
+        *,
+        include_stream_result_metrics: bool = True,
+    ) -> Trajectory | None:
         """Convert Claude session into an ATIF trajectory."""
-        session_files = list(session_dir.glob("*.jsonl"))
+        session_files = (
+            [session_dir]
+            if session_dir.is_file()
+            else list(session_dir.glob("*.jsonl"))
+        )
 
         if not session_files:
             self.logger.debug(f"No Claude Code session files found in {session_dir}")
@@ -735,7 +813,9 @@ class ClaudeCode(BaseInstalledAgent):
         if not events:
             return None
 
-        session_id: str = session_dir.name
+        session_id: str = (
+            session_dir.stem if session_dir.is_file() else session_dir.name
+        )
         for event in events:
             sid = event.get("sessionId")
             if isinstance(sid, str):
@@ -1070,13 +1150,41 @@ class ClaudeCode(BaseInstalledAgent):
             1 for event in events if _is_compaction_boundary(event)
         )
 
+        result_metrics = (
+            self._parse_final_result_metrics_from_stream_json()
+            if include_stream_result_metrics
+            else None
+        )
+        if result_metrics:
+            total_prompt_tokens = int(
+                result_metrics.get("total_prompt_tokens", total_prompt_tokens or 0)
+            )
+            total_completion_tokens = int(
+                result_metrics.get(
+                    "total_completion_tokens", total_completion_tokens or 0
+                )
+            )
+            total_cached_tokens = int(
+                result_metrics.get("total_cached_tokens", total_cached_tokens or 0)
+            )
+
         final_extra: dict[str, Any] | None = {}
         if service_tiers:
             final_extra["service_tiers"] = sorted(service_tiers)
-        if cache_creation_seen:
+        if result_metrics and "total_cache_creation_input_tokens" in result_metrics:
+            final_extra["total_cache_creation_input_tokens"] = int(
+                result_metrics["total_cache_creation_input_tokens"]
+            )
+        elif cache_creation_seen:
             final_extra["total_cache_creation_input_tokens"] = cache_creation_total
-        if cache_read_seen:
+        if result_metrics and "total_cache_read_input_tokens" in result_metrics:
+            final_extra["total_cache_read_input_tokens"] = int(
+                result_metrics["total_cache_read_input_tokens"]
+            )
+        elif cache_read_seen:
             final_extra["total_cache_read_input_tokens"] = cache_read_total
+        if result_metrics and "total_prompt_tokens" in result_metrics:
+            final_extra["metrics_source"] = "claude_code_result.modelUsage"
         if summarization_count:
             final_extra["compacted"] = True
         if not final_extra:
@@ -1091,7 +1199,11 @@ class ClaudeCode(BaseInstalledAgent):
             total_prompt_tokens=total_prompt_tokens,
             total_completion_tokens=total_completion_tokens,
             total_cached_tokens=total_cached_tokens,
-            total_cost_usd=self._parse_total_cost_from_stream_json(),
+            total_cost_usd=(
+                float(result_metrics["total_cost_usd"])
+                if result_metrics and "total_cost_usd" in result_metrics
+                else None
+            ),
             total_steps=len(steps),
             extra=final_extra,
         )
@@ -1111,6 +1223,128 @@ class ClaudeCode(BaseInstalledAgent):
 
         return trajectory
 
+    def _persist_subagent_trajectories(
+        self, session_dir: Path, parent_trajectory: Trajectory
+    ) -> None:
+        """Convert Claude Code subagent JSONLs and link them from the parent."""
+        projects_root = self.logs_dir / "sessions" / "projects"
+        if projects_root.is_dir():
+            source_files = sorted(projects_root.rglob("subagents/*.jsonl"))
+        elif session_dir.is_file():
+            source_files = sorted(
+                (session_dir.parent / session_dir.stem / "subagents").glob("*.jsonl")
+            )
+        else:
+            source_files = sorted(session_dir.rglob("subagents/*.jsonl"))
+        if not source_files:
+            return
+
+        output_dir = self.logs_dir / "subagents"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        converted: list[tuple[Trajectory, Path, dict[str, Any]]] = []
+        for session_file in source_files:
+            try:
+                trajectory = self._convert_events_to_trajectory(
+                    session_file, include_stream_result_metrics=False
+                )
+                if trajectory is None:
+                    self.logger.debug(
+                        f"No valid subagent steps produced from {session_file}"
+                    )
+                    continue
+
+                trajectory.trajectory_id = session_file.stem
+                output_path = output_dir / f"{session_file.stem}.json"
+
+                meta: dict[str, Any] = {}
+                meta_path = session_file.with_suffix(".meta.json")
+                try:
+                    loaded_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded_meta, dict):
+                        meta = loaded_meta
+                except (OSError, json.JSONDecodeError):
+                    self.logger.debug(
+                        f"Could not read subagent metadata from {meta_path}"
+                    )
+
+                converted.append((trajectory, output_path, meta))
+            except Exception:
+                self.logger.exception(
+                    f"Failed to convert Claude Code subagent session {session_file}"
+                )
+
+        all_trajectories = [parent_trajectory, *(item[0] for item in converted)]
+        for trajectory, output_path, meta in converted:
+            try:
+                agent_id = trajectory.trajectory_id.removeprefix("agent-")
+                ref_extra = {
+                    "agent_id": agent_id,
+                    "agent_type": meta.get("agentType"),
+                    "description": meta.get("description"),
+                    "spawn_depth": meta.get("spawnDepth"),
+                }
+                ref = SubagentTrajectoryRef(
+                    trajectory_id=trajectory.trajectory_id,
+                    session_id=trajectory.session_id,
+                    trajectory_path=output_path.relative_to(self.logs_dir).as_posix(),
+                    extra={
+                        key: value
+                        for key, value in ref_extra.items()
+                        if value is not None
+                    }
+                    or None,
+                )
+
+                attached = False
+                tool_use_id = meta.get("toolUseId")
+                if isinstance(tool_use_id, str):
+                    for owner in all_trajectories:
+                        if owner is trajectory:
+                            continue
+                        for step in owner.steps:
+                            if step.observation is None:
+                                continue
+                            for result in step.observation.results:
+                                if result.source_call_id != tool_use_id:
+                                    continue
+                                refs = result.subagent_trajectory_ref or []
+                                refs.append(ref)
+                                result.subagent_trajectory_ref = refs
+                                attached = True
+                                break
+                            if attached:
+                                break
+                        if attached:
+                            break
+
+                if not attached:
+                    self.logger.debug(
+                        "Could not attach subagent trajectory "
+                        f"{trajectory.trajectory_id} to tool call {tool_use_id!r}"
+                    )
+            except Exception:
+                self.logger.exception(
+                    f"Failed to link Claude Code subagent trajectory {output_path}"
+                )
+
+        for trajectory, output_path, _ in converted:
+            try:
+                with open(output_path, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        trajectory.to_json_dict(),
+                        handle,
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                self.logger.debug(
+                    f"Wrote Claude Code subagent trajectory to {output_path}"
+                )
+            except Exception:
+                self.logger.exception(
+                    f"Failed to write Claude Code subagent trajectory {output_path}"
+                )
+
     def populate_context_post_run(self, context: AgentContext) -> None:
         session_dir = self._get_session_dir()
         if not session_dir:
@@ -1127,6 +1361,8 @@ class ClaudeCode(BaseInstalledAgent):
         if not trajectory:
             self.logger.debug("Failed to convert Claude Code session to trajectory")
             return
+
+        self._persist_subagent_trajectories(session_dir, trajectory)
 
         trajectory_path = self.logs_dir / "trajectory.json"
         try:
