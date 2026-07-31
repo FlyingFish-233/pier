@@ -23,6 +23,7 @@ from pier.models.trajectories import (
     Observation,
     ObservationResult,
     Step,
+    SubagentTrajectoryRef,
     ToolCall,
     Trajectory,
 )
@@ -162,23 +163,39 @@ class Codex(BaseInstalledAgent):
         )
 
     def _get_session_dir(self) -> Path | None:
-        """Get the single session directory."""
+        """Get the session root for this trial."""
         sessions_dir = self.logs_dir / "sessions"
         if not sessions_dir.exists():
             return None
 
-        session_dirs = [d for d in sessions_dir.rglob("*") if d.is_dir()]
-        if not session_dirs:
+        if not any(sessions_dir.rglob("*.jsonl")):
             return None
-        max_depth = max(len(d.parts) for d in session_dirs)
-        session_dirs = [d for d in session_dirs if len(d.parts) == max_depth]
-        if not session_dirs:
-            return None
+        return sessions_dir
 
-        # Sanity check: there should be exactly one session
-        if len(session_dirs) != 1:
-            raise ValueError(f"Expected exactly 1 session, found {len(session_dirs)}")
-        return session_dirs[0]
+    @staticmethod
+    def _read_session_meta(session_file: Path) -> dict[str, Any]:
+        """Read the session_meta payload from a Codex rollout file."""
+        try:
+            with open(session_file, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("type") != "session_meta":
+                        continue
+                    payload = event.get("payload")
+                    return payload if isinstance(payload, dict) else {}
+        except OSError:
+            return {}
+        return {}
+
+    @classmethod
+    def _is_subagent_session(cls, session_file: Path) -> bool:
+        payload = cls._read_session_meta(session_file)
+        return payload.get("thread_source") == "subagent" or isinstance(
+            payload.get("parent_thread_id"), str
+        )
 
     @staticmethod
     def _extract_message_text(content: list[Any]) -> str:
@@ -322,7 +339,9 @@ class Codex(BaseInstalledAgent):
         peak_context_tokens: int | None = None
         window_peak: int | None = None
         token_drop_summarization_count = 0
-        compacted_item_count = sum(1 for event in raw_events if event.get("type") == "compacted")
+        compacted_item_count = sum(
+            1 for event in raw_events if event.get("type") == "compacted"
+        )
         context_compacted_event_count = 0
         saw_usage = False
 
@@ -601,15 +620,21 @@ class Codex(BaseInstalledAgent):
             + output * output_rate
         )
 
-    def _convert_events_to_trajectory(self, session_dir: Path) -> Trajectory | None:
+    def _convert_events_to_trajectory(self, session_path: Path) -> Trajectory | None:
         """Convert Codex session JSONL events into an ATIF trajectory."""
-        session_files = list(session_dir.glob("*.jsonl"))
+        if session_path.is_file():
+            session_files = [session_path]
+        else:
+            session_files = sorted(session_path.rglob("*.jsonl"))
 
         if not session_files:
-            self.logger.debug(f"No Codex session files found in {session_dir}")
+            self.logger.debug(f"No Codex session files found in {session_path}")
             return None
 
-        session_file = session_files[0]
+        primary_files = [
+            path for path in session_files if not self._is_subagent_session(path)
+        ]
+        session_file = primary_files[0] if primary_files else session_files[0]
 
         raw_events: list[dict[str, Any]] = []
         with open(session_file, "r") as handle:
@@ -633,7 +658,7 @@ class Codex(BaseInstalledAgent):
         session_id = (
             session_meta.get("payload", {}).get("id")
             if session_meta and isinstance(session_meta, dict)
-            else session_dir.name
+            else session_file.stem
         )
 
         agent_version = "unknown"
@@ -963,6 +988,140 @@ class Codex(BaseInstalledAgent):
 
         return trajectory
 
+    @staticmethod
+    def _subagent_id_from_content(content: Any) -> str | None:
+        """Extract an agent_id from a spawn_agent tool result."""
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(content, dict):
+            return None
+        agent_id = content.get("agent_id")
+        return agent_id if isinstance(agent_id, str) else None
+
+    def _persist_subagent_trajectories(
+        self, session_dir: Path, parent_trajectory: Trajectory
+    ) -> int:
+        """Convert Codex subagent rollouts and link them from their owners."""
+        source_files = sorted(
+            path
+            for path in session_dir.rglob("*.jsonl")
+            if self._is_subagent_session(path)
+        )
+        if not source_files:
+            return 0
+
+        output_dir = self.logs_dir / "subagents"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        converted: list[tuple[Trajectory, Path, dict[str, Any]]] = []
+        for session_file in source_files:
+            try:
+                meta = self._read_session_meta(session_file)
+                agent_id = meta.get("id")
+                if not isinstance(agent_id, str):
+                    self.logger.debug(
+                        f"Codex subagent session has no id: {session_file}"
+                    )
+                    continue
+
+                trajectory = self._convert_events_to_trajectory(session_file)
+                if trajectory is None:
+                    self.logger.debug(
+                        f"No valid subagent steps produced from {session_file}"
+                    )
+                    continue
+
+                trajectory.trajectory_id = f"agent-{agent_id}"
+                output_path = output_dir / f"{trajectory.trajectory_id}.json"
+                converted.append((trajectory, output_path, meta))
+            except Exception:
+                self.logger.exception(
+                    f"Failed to convert Codex subagent session {session_file}"
+                )
+
+        all_trajectories = [parent_trajectory, *(item[0] for item in converted)]
+        for trajectory, output_path, meta in converted:
+            try:
+                agent_id = trajectory.trajectory_id.removeprefix("agent-")
+                parent_thread_id = meta.get("parent_thread_id")
+                source = meta.get("source")
+                spawn = (
+                    source.get("subagent", {}).get("thread_spawn", {})
+                    if isinstance(source, dict)
+                    else {}
+                )
+                spawn_depth = spawn.get("depth") if isinstance(spawn, dict) else None
+                ref_extra = {
+                    "agent_id": agent_id,
+                    "nickname": meta.get("agent_nickname"),
+                    "parent_thread_id": parent_thread_id,
+                    "spawn_depth": spawn_depth,
+                }
+                ref = SubagentTrajectoryRef(
+                    trajectory_id=trajectory.trajectory_id,
+                    session_id=trajectory.session_id,
+                    trajectory_path=output_path.relative_to(self.logs_dir).as_posix(),
+                    extra={
+                        key: value
+                        for key, value in ref_extra.items()
+                        if value is not None
+                    }
+                    or None,
+                )
+
+                attached = False
+                for owner in all_trajectories:
+                    if owner is trajectory:
+                        continue
+                    if (
+                        isinstance(parent_thread_id, str)
+                        and owner.session_id != parent_thread_id
+                    ):
+                        continue
+                    for step in owner.steps:
+                        if step.observation is None:
+                            continue
+                        for result in step.observation.results:
+                            if (
+                                self._subagent_id_from_content(result.content)
+                                != agent_id
+                            ):
+                                continue
+                            refs = result.subagent_trajectory_ref or []
+                            refs.append(ref)
+                            result.subagent_trajectory_ref = refs
+                            attached = True
+                            break
+                        if attached:
+                            break
+                    if attached:
+                        break
+
+                if not attached:
+                    self.logger.debug(
+                        "Could not attach Codex subagent trajectory "
+                        f"{trajectory.trajectory_id} to its spawn_agent result"
+                    )
+            except Exception:
+                self.logger.exception(
+                    f"Failed to link Codex subagent trajectory {output_path}"
+                )
+
+        for trajectory, output_path, _ in converted:
+            try:
+                with open(output_path, "w", encoding="utf-8") as handle:
+                    handle.write(format_trajectory_json(trajectory.to_json_dict()))
+                self.logger.debug(f"Wrote Codex subagent trajectory to {output_path}")
+            except OSError:
+                self.logger.exception(
+                    f"Failed to write Codex subagent trajectory {output_path}"
+                )
+
+        return len(converted)
+
     def populate_context_post_run(self, context: AgentContext) -> None:
         """
         Populate the agent context after Codex finishes executing.
@@ -984,6 +1143,8 @@ class Codex(BaseInstalledAgent):
         if not trajectory:
             self.logger.debug("Failed to convert Codex session to trajectory")
             return
+
+        self._persist_subagent_trajectories(session_dir, trajectory)
 
         trajectory_path = self.logs_dir / "trajectory.json"
         try:

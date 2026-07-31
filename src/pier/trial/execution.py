@@ -172,6 +172,8 @@ class TrialExecution:
             extra_kwargs["mcp_servers"] = task.config.environment.mcp_servers
         if task.config.environment.skills_dir:
             extra_kwargs["skills_dir"] = task.config.environment.skills_dir
+        if agent_config.kwargs.get("skill_by_task_name"):
+            extra_kwargs["task_name"] = task.name
 
         return AgentFactory.create_agent_from_config(
             agent_config,
